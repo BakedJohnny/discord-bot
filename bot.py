@@ -1,5 +1,7 @@
-from ast import parse
+﻿from ast import parse
 import discord
+import requests
+import base64
 import re
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -9,11 +11,12 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import asyncio
 import time
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime
 import gspread_formatting as gf
 from gspread.utils import rowcol_to_a1
-from poolfinder import get_data_based_on_selection
+from poolfinder import get_data_based_on_selection, get_data_by_talent_type
+
 
 SPREADSHEET_ID = 'sheetid'
 # Google Sheets and Drive setup
@@ -73,6 +76,46 @@ def bold_search_terms(text, search_terms):
     for term in search_terms:
         text = text.replace(term, f"**{term}**")
     return text
+
+# Function to create a paginator for talent types
+class TalentTypePaginator(discord.ui.View):
+    def __init__(self, data: List[str], exact_talent_type: str, color=discord.Color.green()):
+        super().__init__(timeout=None)
+        self.data = data
+        self.title = f"Talent Type Finder Results for '{exact_talent_type}'"
+        self.color = color
+        self.current_page = 0
+        self.embeds = self.create_embeds()
+
+    def create_embeds(self):
+        embeds = []
+        embed = discord.Embed(title=self.title, color=self.color)
+        
+        for index, item in enumerate(self.data):
+            if index > 0 and index % 10 == 0:
+                embed.set_footer(text=f"Page {len(embeds) + 1} of {len(self.data) // 10 + 1}\nUse /poolfind to know more about specific talents.")
+                embeds.append(embed)
+                embed = discord.Embed(title=self.title, color=self.color)
+            embed.add_field(name="Talent Name", value=item, inline=False)
+        
+        embed.set_footer(text=f"Page {len(embeds) + 1} of {len(self.data) // 10 + 1}\nUse /poolfind to know more about specific talents.")
+        embeds.append(embed)
+        return embeds
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page > 0:
+            self.current_page -= 1
+            await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page < len(self.embeds) - 1:
+            self.current_page += 1
+            await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
+
+    async def send_initial_message(self, interaction: discord.Interaction):
+        await interaction.followup.send(embed=self.embeds[self.current_page], view=self)
 
 class Paginator(discord.ui.View):
     def __init__(self, data, column_titles, rows_per_embed, search_terms, user_id, allowed_user_id=None, timeout=180):
@@ -445,37 +488,71 @@ async def sheet_link(interaction: discord.Interaction, sheet_name: str, allowed_
     except Exception as e:
         print(f"An error occurred: {str(e)}")
 
-def create_poolfind_embed(data, x, y):
+def create_poolfind_embed(data, inputs):
     embed = discord.Embed(title="Pool Finder Results", color=discord.Color.blue())
-    embed.description = f"Results for values: `{x}` and `{y}` in column B"
+    embed.description = f"Results for values: `{', '.join(inputs)}` in column B"
 
-    for row in data:
+    for index, row in enumerate(data):
         # Ensure there's enough columns in the row
-        if len(row) >= 4:
+        if len(row) >= 5:
             col_a = row[0]
             col_b = row[1]
             col_c = row[2]
-            hyperlink = row[3]
+            col_d = row[3]
+            hyperlink = row[4]
 
             # Format col_b as a clickable link if it contains a URL
-            if hyperlink:
+            if hyperlink and hyperlink.lower() != 'false':
                 col_b = f"[{col_b}]({hyperlink})"
 
-            embed.add_field(name="Row Details", value=f"**Priority:** {col_a}\n**Talent Name:** {col_b}\n**Rarity:** {col_c}", inline=False)
+            # Add blue upward and downward arrow indicators
+            if index == 0:
+                indicator = "🔵⬆️ Top"
+            elif index == len(data) - 1:
+                indicator = "🔵⬇️ Bottom"
+            else:
+                indicator = ""
+
+            embed.add_field(name=f"Row Details {indicator}", value=f"**Priority:** {col_a}\n**Talent Name:** {col_b}\n**Rarity:** {col_c}\n**Additional Info:** {col_d}", inline=False)
 
     return embed
 
 @bot.tree.command(name="poolfind", description="Find data in the pool finder sheet")
-@app_commands.describe(x="Value for column X", y="Value for column Y")
-async def poolfind(interaction: discord.Interaction, x: str, y: str):
+@app_commands.describe(required_input="Required value for column B", optional_input_1="Optional value 1 for column B", optional_input_2="Optional value 2 for column B", optional_input_3="Optional value 3 for column B", optional_input_4="Optional value 4 for column B")
+async def poolfind(interaction: discord.Interaction, required_input: str, optional_input_1: Optional[str] = None, optional_input_2: Optional[str] = None, optional_input_3: Optional[str] = None, optional_input_4: Optional[str] = None):
     try:
-        data = get_data_based_on_selection(SPREADSHEET_ID, x, y, creds)
+        await interaction.response.defer()  # Defer the interaction response to allow more time for processing
+
+        # Collect the inputs
+        inputs = [required_input]
+        if optional_input_1: inputs.append(optional_input_1)
+        if optional_input_2: inputs.append(optional_input_2)
+        if optional_input_3: inputs.append(optional_input_3)
+        if optional_input_4: inputs.append(optional_input_4)
+
+        data = get_data_based_on_selection(SPREADSHEET_ID, inputs, creds)
         if data:
-            embed = create_poolfind_embed(data, x, y)
-            await interaction.response.send_message(embed=embed)
+            embed = create_poolfind_embed(data, inputs)
+            await interaction.followup.send(embed=embed)
         else:
-            await interaction.response.send_message("No data found for the given selections.")
+            await interaction.followup.send("No data found for the given selections.")
     except Exception as e:
-        await interaction.response.send_message(f"An error occurred: {str(e)}")
+        await interaction.followup.send(f"An error occurred: {str(e)}")
+
+@bot.tree.command(name="talenttype", description="Find talents by talent type in the pool finder sheet")
+@app_commands.describe(talent_type="Talent type to search for in column C")
+async def talenttype(interaction: discord.Interaction, talent_type: str):
+    try:
+        await interaction.response.defer()  # Defer the interaction response to allow more time for processing
+
+        data, exact_talent_type = get_data_by_talent_type(SPREADSHEET_ID, talent_type, creds)
+        if data:
+            paginator = TalentTypePaginator(data, exact_talent_type=exact_talent_type)
+            await paginator.send_initial_message(interaction)
+        else:
+            await interaction.followup.send("No data found for the given talent type.")
+    except Exception as e:
+        await interaction.followup.send(f"An error occurred: {str(e)}")
+
 
 bot.run('TOKEN')
